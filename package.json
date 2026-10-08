@@ -21,6 +21,6 @@
       "properties": { "eclipseRemote.configFile": { "type": "string", "default": ".vscode/eclipse-remote-build.json", "description": "Workspace-relative settings file", "scope": "resource" } }
     }
   },
-  "scripts": { "compile": "tsc -p .", "watch": "tsc --watch -p .", "check": "tsc --noEmit -p .", "package": "npm run compile && vsce package --no-dependencies" },
+  "scripts": { "compile": "tsc -p .", "watch": "tsc --watch -p .", "check": "tsc --noEmit -p .", "package": "npm run compile && vsce package --no-dependencies --skip-license" },
   "devDependencies": { "@types/node": "^22.0.0", "@types/vscode": "1.90.0", "typescript": "^5.7.3", "@vscode/vsce": "^3.2.0" }
 }

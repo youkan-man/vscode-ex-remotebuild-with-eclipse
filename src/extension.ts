@@ -172,14 +172,15 @@ type Action='build'|'sync'|'provision';
 async function operation(action: Action,folder=workspace(),selectedName?: string): Promise<void> {
   if (!vscode.workspace.isTrusted) throw Error('Trust this workspace before running remote commands');
   if (busy) throw Error('An Eclipse Remote Build operation is already running');
-  const s=await load(folder); validate(s); let profile: Profile|undefined;
-  if (action==='build') {
-    const name=selectedName || await vscode.window.showQuickPick(s.profiles.map(p=>p.name),{placeHolder:'Select Eclipse build profile'});
-    if (!name) return; profile=s.profiles.find(p=>p.name===name); if(!profile) throw Error('Build profile not found');
-    await resolveProfile(profile,folder.uri.fsPath);
-  }
-  busy=true; output.show(true);
+  busy=true;
   try {
+    const s=await load(folder); validate(s); let profile: Profile|undefined;
+    if (action==='build') {
+      const name=selectedName || await vscode.window.showQuickPick(s.profiles.map(p=>p.name),{placeHolder:'Select Eclipse build profile'});
+      if (!name) return; profile=s.profiles.find(p=>p.name===name); if(!profile) throw Error('Build profile not found');
+      await resolveProfile(profile,folder.uri.fsPath);
+    }
+    output.show(true);
     await vscode.window.withProgress({location:vscode.ProgressLocation.Notification,title:'Eclipse Remote Build: '+action,cancellable:true},async(_progress,token)=>{
       if (action==='provision') {
         await provision(s,folder.uri.fsPath,token);
