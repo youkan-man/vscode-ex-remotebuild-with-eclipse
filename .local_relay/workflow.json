@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "packages": {
+    "apt": [
+      "ca-certificates",
+      "nodejs",
+      "npm",
+      "openssh-client",
+      "rsync"
+    ]
+  },
+  "steps": [
+    {
+      "name": "install-and-typecheck",
+      "run": "npm install --no-audit --no-fund && npm run check"
+    },
+    {
+      "name": "compile",
+      "run": "npm run compile"
+    },
+    {
+      "name": "package",
+      "run": "npx --no-install vsce package --no-dependencies"
+    },
+    {
+      "name": "evidence",
+      "run": "mkdir -p .local_relay/output && cp package.json .local_relay/output/package.json && ls -la dist/ > .local_relay/output/compile-files.txt"
+    }
+  ]
+}
