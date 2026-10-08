@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { Action, defaults, localPath, normalize, prepare, preview, Preview, Settings } from './configuration';
+import { Action, defaults, localPath, normalize, prepare, preview, Preview, Settings, Snapshot } from './configuration';
 import { ConfigurationSession } from './session';
 import { RemoteRuntime } from './runtime';
 import { registerSidebar, SidebarState } from './sidebar';
@@ -13,6 +13,7 @@ export function activate(context: vscode.ExtensionContext): void {
   let session: ConfigurationSession | undefined, folder: vscode.WorkspaceFolder | undefined;
   let panel: vscode.WebviewPanel | undefined, panelReady = false, running = false, saving = false;
   let effective: Preview[] = [], previewKey = '', previewTicket = 0, epoch = 0;
+  let activePlan: Snapshot | undefined;
   let flush: { id: string; done: () => void; fail: (e: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
   const getFolder = () => {
     const all = vscode.workspace.workspaceFolders;
@@ -33,7 +34,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const read = (relative: string) => readAt(getFolder().uri.fsPath, relative);
   const sidebarState = (): SidebarState | undefined => {
     if (!session) return;
-    const s = session.data, i = session.selected, p = effective[i];
+    const s = activePlan?.settings || session.data, i = session.selected;
+    const p: Preview | undefined = activePlan?.profile ? { profile: activePlan.profile, origin: activePlan.profile.profileFile || '画面設定' } : effective[i];
     return { host: s.ssh.host ? `${s.ssh.user ? s.ssh.user + '@' : ''}${s.ssh.host}:${s.ssh.port}` : '', container: s.remote.container, profile: s.profiles[i]?.name || '', configuration: p?.error ? '構成JSONエラー' : p?.profile ? p.profile.project + ' / ' + p.profile.configuration : '解決中', status: session.status, busy: session.busy, dirty: session.dirty, conflict: session.conflict };
   };
   const refreshSidebar = registerSidebar(context, sidebarState);
@@ -45,7 +47,7 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   const changed = () => {
     if (!session) return;
-    const key = session.revision + ':' + epoch;
+    const key = JSON.stringify(session.data.profiles) + ':' + epoch;
     if (key !== previewKey) {
       previewKey = key; effective = []; const ticket = ++previewTicket;
       void Promise.all(session.data.profiles.map(p => preview(p, read))).then(values => {
@@ -88,6 +90,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const root = getFolder().uri.fsPath;
       if (action === 'build' && state.errors[state.selected]) throw new Error(state.errors[state.selected]);
       const plan = await prepare(action, state.data, state.selected, p => readAt(root, p));
+      activePlan = plan; publish();
       const target = `${plan.settings.ssh.host}:${plan.settings.ssh.port}`;
       output.show(true); output.appendLine('実行先: ' + target + (plan.profile ? ' / ' + plan.profile.project + '/' + plan.profile.configuration : ''));
       const result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Eclipse Remote Build', cancellable: true }, async (progress, token) => {
@@ -99,7 +102,7 @@ export function activate(context: vscode.ExtensionContext): void {
       });
       state.signal(result); output.appendLine(result); return result;
     } catch (e) { if (e instanceof vscode.CancellationError) state?.signal('キャンセルしました（リモート処理は終了未確認）'); else error(e); return false; }
-    finally { running = false; if (state) state.signal(state.status, false); }
+    finally { activePlan = undefined; running = false; if (state) state.signal(state.status, false); }
   };
   const save = async () => {
     if (saving || running) return;
@@ -148,7 +151,7 @@ export function activate(context: vscode.ExtensionContext): void {
             if (p) await vscode.window.showTextDocument(vscode.Uri.file(localPath(getFolder().uri.fsPath, p)));
             return;
           }
-          if (m.type === 'pick' && typeof m.field === 'string' && /^(?:ssh.identityFile|provision.dockerfile|provision.archives.\d+.source|profiles.\d+.profileFile)$/.test(m.field)) {
+          if (m.type === 'pick' && typeof m.field === 'string' && /^(?:ssh\.identityFile|provision\.dockerfile|provision\.archives\.\d+\.source|profiles\.\d+\.profileFile)$/.test(m.field)) {
             const chosen = await vscode.window.showOpenDialog({ defaultUri: getFolder().uri, canSelectMany: false, canSelectFiles: true, canSelectFolders: false });
             if (chosen?.[0]) {
               const value = m.field === 'ssh.identityFile' ? chosen[0].fsPath : path.relative(getFolder().uri.fsPath, chosen[0].fsPath);
@@ -163,7 +166,7 @@ export function activate(context: vscode.ExtensionContext): void {
     } catch (e) { error(e); }
   };
   const selectProfile = async () => {
-    const state = await ensure(); if (running) return;
+    const state = await ensure(); if (running || saving) return;
     await flushDraft();
     const selected = await vscode.window.showQuickPick(state.data.profiles.map((p, index) => ({ label: p.name || '(未設定)', description: effective[index]?.profile?.configuration, index })), { placeHolder: '使用するプロファイル' });
     if (selected) state.select(selected.index);
