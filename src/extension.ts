@@ -44,10 +44,10 @@ function absWorkspace(root: string, rel: string): string {
   return path.resolve(root, safeRel(rel));
 }
 function validate(s: Settings): void {
-  if (!s.ssh.host || !/^[a-zA-Z0-9_.:-]+$/.test(s.ssh.host)) throw Error('Invalid SSH host');
+  if (!s.ssh.host || !/^[a-zA-Z0-9_][a-zA-Z0-9_.:-]*$/.test(s.ssh.host)) throw Error('Invalid SSH host');
   if (s.ssh.user && !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(s.ssh.user)) throw Error('Invalid SSH user');
   if (!Number.isInteger(s.ssh.port) || s.ssh.port<1 || s.ssh.port>65535) throw Error('Invalid SSH port');
-  if (!s.remote.root.startsWith('/') || s.remote.root === '/') throw Error('Remote root must be an absolute, non-root path');
+  if (!s.remote.root.startsWith('/') || path.posix.normalize(s.remote.root) === '/') throw Error('Remote root must be an absolute, non-root path');
   if (!/^[a-zA-Z0-9_.-]+$/.test(s.remote.container)) throw Error('Invalid container name');
   if (!/^[a-zA-Z0-9_./-]+$/.test(s.remote.dockerCommand)) throw Error('dockerCommand must be a command path');
   s.sync.include.forEach(safeRel); s.sync.exclude.forEach(x => {if (x.startsWith('/') || x.includes('..')) throw Error('Unsafe exclude: '+x);});
@@ -90,6 +90,7 @@ function sshArgs(s: Settings): string[] {
 }
 function target(s: Settings): string {return (s.ssh.user ? s.ssh.user+'@' : '')+s.ssh.host;}
 function execute(cmd: string, args: string[], cwd: string, token?: vscode.CancellationToken): Promise<void> {
+  if(token?.isCancellationRequested) return Promise.reject(new vscode.CancellationError());
   return new Promise((resolve,reject) => {
     output.appendLine('$ '+[cmd,...args].map(a => /password|token/i.test(a)?'[masked]':quote(a)).join(' '));
     const child=spawn(cmd,args,{cwd,stdio:['ignore','pipe','pipe'],shell:false});
@@ -103,28 +104,33 @@ function execute(cmd: string, args: string[], cwd: string, token?: vscode.Cancel
 async function ssh(s:Settings, root:string, command:string, token?:vscode.CancellationToken):Promise<void> {
   await execute('ssh',[...sshArgs(s),target(s),command],root,token);
 }
-async function synchronize(s:Settings, root:string, token?:vscode.CancellationToken):Promise<void> {
-  validate(s);
-  const remote=s.remote.root.replace(/\/$/,'');
-  await ssh(s,root,'mkdir -p '+quote(remote),token);
-  const sshCmd=['ssh','-p',String(s.ssh.port),'-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
-    ...(s.ssh.identityFile?['-i',s.ssh.identityFile]:[])].map(quote).join(' ');
-  const base=['-az','--checksum','--protect-args','--relative','-e',sshCmd];
-  const paths=[...new Set([...s.sync.include,...s.sync.profileFiles].map(safeRel))];
-  for(const rel of paths){
-    const local=absWorkspace(root,rel);
-    await fs.stat(local); // reject missing inputs
-    const args=[...base,...s.sync.exclude.flatMap(x=>['--exclude',x]),rel,target(s)+':'+remote+'/'];
-    await execute('rsync',args,root,token);
+async function transfer(s:Settings, root:string, paths:string[], remote:string, exclude:string[], token?:vscode.CancellationToken):Promise<void> {
+  const sshCmd=['ssh',...sshArgs(s)].map(quote).join(' ');
+  const args=['-az','--checksum','--protect-args','--relative','--itemize-changes','-e',sshCmd];
+  const host=s.ssh.host.includes(':') ? '['+s.ssh.host+']' : s.ssh.host;
+  const destination=(s.ssh.user ? s.ssh.user+'@' : '')+host+':'+remote+'/';
+  for(const rel of [...new Set(paths.map(safeRel))]) {
+    if(token?.isCancellationRequested) throw new vscode.CancellationError();
+    await fs.stat(absWorkspace(root,rel));
+    await execute('rsync',[...args,...exclude.flatMap(x=>['--exclude',x]),'--','./'+rel,destination],root,token);
   }
 }
+async function synchronize(s:Settings, root:string, token?:vscode.CancellationToken):Promise<void> {
+  validate(s);
+  const remote=path.posix.normalize(s.remote.root).replace(/\/$/,'');
+  await ssh(s,root,'mkdir -p -- '+quote(remote),token);
+  await transfer(s,root,s.sync.include,remote,s.sync.exclude,token);
+  // Explicit build profiles must not be dropped by source exclusion patterns.
+  await transfer(s,root,s.sync.profileFiles,remote,[],token);
+}
 function containerPath(s:Settings,rel:string):string {
-  return '/workspace/'+safeRel(rel).replace(/^\.\/?/,'');
+  const normalized=safeRel(rel);
+  return normalized==='.' ? '/workspace/' : '/workspace/'+normalized;
 }
 async function build(s:Settings, p:Profile, root:string, token?:vscode.CancellationToken):Promise<void>{
   const docker=s.remote.dockerCommand;
   const args=[
-    'exec',...Object.entries(p.environment).flatMap(([k,v])=>{
+    'exec','-w','/workspace',...Object.entries(p.environment).flatMap(([k,v])=>{
       if(!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(k)) throw Error('Invalid environment key: '+k);
       return ['-e',k+'='+v];
     }),s.remote.container,p.eclipseExecutable,
@@ -137,15 +143,9 @@ async function build(s:Settings, p:Profile, root:string, token?:vscode.Cancellat
   await ssh(s,root,cmd,token);
 }
 async function provision(s:Settings,root:string,token?:vscode.CancellationToken):Promise<void>{
-  // Archive list is resolved relative to workspace and uploaded by rsync. Dockerfile is workspace-local.
   const paths=[...s.provision.archives.map(a=>a.source),s.provision.dockerfile].map(safeRel);
-  await ssh(s,root,'mkdir -p '+quote(s.remote.root),token);
-  const sshCmd=['ssh','-p',String(s.ssh.port),'-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
-    ...(s.ssh.identityFile?['-i',s.ssh.identityFile]:[])].map(quote).join(' ');
-  for(const rel of paths){
-    await fs.stat(absWorkspace(root,rel));
-    await execute('rsync',['-az','--checksum','--relative','-e',sshCmd,rel,target(s)+':'+s.remote.root+'/'],root,token);
-  }
+  await ssh(s,root,'mkdir -p -- '+quote(s.remote.root),token);
+  await transfer(s,root,paths,s.remote.root.replace(/\/$/,''),[],token);
   const args=[s.remote.dockerCommand,'build','-f',s.remote.root+'/'+safeRel(s.provision.dockerfile),
     '-t',s.provision.image,'--build-arg','BASE_IMAGE='+s.provision.baseImage,s.remote.root];
   await ssh(s,root,args.map(quote).join(' '),token);
