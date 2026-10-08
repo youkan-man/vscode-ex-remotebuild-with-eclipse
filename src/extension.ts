@@ -136,7 +136,7 @@ export function activate(context: vscode.ExtensionContext): void {
           if (m.type === 'ready') { panelReady = true; publish(true); return; }
           if (m.type === 'draft') {
             state.update(m.settings, m.errors || {}, m.raw || {}, m.selected);
-            if (flush?.id === m.id) { const pending = flush; flush = undefined; clearTimeout(pending.timer); pending.done(); }
+            if (flush && flush.id === m.id) { const pending = flush; flush = undefined; clearTimeout(pending.timer); pending.done(); }
             return;
           }
           if (m.type === 'select') { state.select(m.index); return; }
@@ -159,7 +159,7 @@ export function activate(context: vscode.ExtensionContext): void {
               post({ type: 'picked', field: m.field, value });
             }
           }
-        } catch (e) { error(e); if (flush?.id === m.id) { clearTimeout(flush.timer); flush.fail(e as Error); flush = undefined; } }
+        } catch (e) { error(e); if (flush && flush.id === m.id) { clearTimeout(flush.timer); flush.fail(e as Error); flush = undefined; } }
       });
       current.onDidDispose(() => { listener.dispose(); if (panel === current) { panel = undefined; panelReady = false; } if (flush) { clearTimeout(flush.timer); flush.fail(new Error('設定画面が閉じられました')); flush = undefined; } });
       current.webview.html = html;
