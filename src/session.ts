@@ -102,6 +102,7 @@ export class WorkspaceSession {
       for (const rel of pinnedPaths) await walk(rel);
       const base = settings.profiles[selected];
       const bytes = base?.profileFile ? captured.get(relative(base.profileFile)) : undefined;
+      if (build && base?.profileFile && !bytes) throw Error('構成JSONには通常のファイルを指定してください: ' + base.profileFile);
       const profile = build && base ? resolveProfile(base, bytes).profile : undefined;
       const digest = bytes ? hash(bytes) : undefined;
       return { settings, profile, staging, pinnedPaths, digest, dispose: () => fs.rm(staging, { recursive: true, force: true }) };

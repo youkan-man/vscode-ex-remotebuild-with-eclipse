@@ -19,11 +19,13 @@ function renderTarget() {
   $('target').innerHTML = `<span>接続先 <strong>${esc((s.ssh.user ? s.ssh.user + '@' : '') + (s.ssh.host || '未設定') + ':' + s.ssh.port)}</strong></span><span>コンテナ <strong>${esc(s.remote.container)}</strong></span><span>適用構成 <strong>${esc(p ? p.project + ' / ' + p.configuration : '未確定')}</strong></span>`;
 }
 function renderProfiles() {
+  const keepRadioFocus = document.activeElement?.getAttribute('name') === 'selectedProfile';
   $('profiles').innerHTML = draft.data.profiles.map((p, i) => {
     const e = effective[i], resolved = e?.profile;
     return `<tr aria-selected="${i === draft.selected}" data-select="${i}"><td><input type="radio" name="selectedProfile" aria-label="${esc(p.name)}を選択" value="${i}" ${busy ? 'disabled' : ''} ${i === draft.selected ? 'checked' : ''}></td><td>${esc(p.name)}</td><td>${esc(e?.error || (resolved ? resolved.project + ' / ' + resolved.configuration : '読込中'))}</td><td>${esc(p.profileFile || '画面の設定')}</td></tr>`;
   }).join('');
   $('emptyProfiles').hidden = draft.data.profiles.length > 0;
+  if (keepRadioFocus) $('profiles').querySelector('input:checked')?.focus({ preventScroll: true });
 }
 function renderEditor() {
   const i = draft.selected, p = draft.data.profiles[i];
