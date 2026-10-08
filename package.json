@@ -2,7 +2,7 @@
   "name": "eclipse-remote-build",
   "displayName": "Eclipse Remote Build",
   "description": "Workspace-relative incremental SSH sync and Docker Eclipse CDT builds",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "publisher": "youkan-man",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
@@ -18,28 +18,11 @@
       { "command": "eclipseRemote.deploy", "title": "Eclipse Remote Build: Dockerへデプロイ" },
       { "command": "eclipseRemote.showOutput", "title": "Eclipse Remote Build: ログを表示" }
     ],
-    "viewsContainers": {
-      "activitybar": [{ "id": "eclipseRemote", "title": "Eclipse Build", "icon": "media/eclipse-build.svg" }]
-    },
-    "views": {
-      "eclipseRemote": [{ "id": "eclipseRemote.actions", "name": "リモートビルド", "contextualTitle": "Eclipse Build", "icon": "media/eclipse-build.svg" }]
-    },
-    "viewsWelcome": [{
-      "view": "eclipseRemote.actions",
-      "contents": "ビルドするワークスペースのフォルダーを開いてください。\n[フォルダーを開く](command:vscode.openFolder)",
-      "when": "workbenchState == empty"
-    }],
-    "configuration": {
-      "title": "Eclipse Remote Build",
-      "properties": { "eclipseRemote.configFile": { "type": "string", "default": ".vscode/eclipse-remote-build.json", "description": "Workspace-relative settings file", "scope": "resource" } }
-    }
+    "viewsContainers": { "activitybar": [{ "id": "eclipseRemote", "title": "Eclipse Build", "icon": "media/eclipse-build.svg" }] },
+    "views": { "eclipseRemote": [{ "id": "eclipseRemote.actions", "name": "リモートビルド", "contextualTitle": "Eclipse Build", "icon": "media/eclipse-build.svg" }] },
+    "viewsWelcome": [{ "view": "eclipseRemote.actions", "contents": "ビルドするワークスペースのフォルダーを開いてください。\n[フォルダーを開く](command:vscode.openFolder)", "when": "workbenchState == empty" }],
+    "configuration": { "title": "Eclipse Remote Build", "properties": { "eclipseRemote.configFile": { "type": "string", "default": ".vscode/eclipse-remote-build.json", "description": "Workspace-relative settings file", "scope": "resource" } } }
   },
-  "scripts": {
-    "compile": "tsc -p .",
-    "watch": "tsc --watch -p .",
-    "check": "tsc --noEmit -p .",
-    "vscode:prepublish": "npm run compile",
-    "package": "vsce package --no-dependencies --skip-license"
-  },
+  "scripts": { "compile": "tsc -p .", "watch": "tsc --watch -p .", "check": "tsc --noEmit -p .", "vscode:prepublish": "npm run compile", "package": "vsce package --no-dependencies --skip-license" },
   "devDependencies": { "@types/node": "^22.0.0", "@types/vscode": "1.90.0", "typescript": "^5.7.3", "@vscode/vsce": "^3.2.0" }
 }

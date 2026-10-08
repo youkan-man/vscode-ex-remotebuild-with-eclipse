@@ -1,19 +1,17 @@
 # Eclipse Remote Build
 
-SSHでソースを差分転送し、Docker内のEclipse CDTでビルドするVS Code拡張。
+SSHで差分転送し、Docker内のEclipse CDTでビルドするVS Code拡張。
 
-**[VSIXをダウンロード](packages/eclipse-remote-build-0.2.2.vsix?raw=true)** → VS Codeの「拡張機能 → … → VSIXからのインストール」。
+**[VSIX 0.3.0](packages/eclipse-remote-build-0.3.0.vsix?raw=true)** を「VSIXからのインストール」で導入し、左の **Eclipse Build** アイコンから開きます。
 
-左のアクティビティバーの **Eclipse Build** アイコンから、設定・Dockerデプロイ・同期・ビルド・ログを開けます。設定画面は開いているタブを再利用します。
+設定画面と左ペインは同じ編集中の設定・選択プロファイルで実行します。ファイルへの保存は「設定を保存」。外部の構成JSONは適用値と適用元を表示し、実行開始時の内容を固定して転送・ビルドします。選択したプロファイルだけを編集します。
 
-「設定を開く」でSSH接続先・転送先・Eclipseとツールチェーンのアーカイブを設定します。**「Dockerへデプロイ」** がアーカイブ転送、イメージ構築、コンテナ作成・起動、起動確認まで実行します。既存環境の置換時だけ確認します。その後「同期してビルド」で実行します。
+「Dockerへデプロイ」でアーカイブ転送・イメージ構築・コンテナ起動まで実行します。既存コンテナの置換には確認を表示します。
 
-ローカルにSSHとrsync、接続先に起動済みDocker Engineとrsyncが必要です。SSH鍵とホスト鍵を事前に設定してください。WindowsではVS CodeをWSLで開いて使用します。Docker Engine自体のインストールは行いません。
+ローカルにSSH・rsync、接続先に起動済みDocker Engine・rsyncが必要です。鍵とホスト鍵は事前設定してください。WindowsではWSL側で開きます。
 
-設定は `.vscode/eclipse-remote-build.json`。ソース・アーカイブ・構成JSONのパスはワークスペース基準です。追加引数・環境変数の `${workspaceFolder}` は `/workspace` に解決します。
+設定: `.vscode/eclipse-remote-build.json`。ソース・構成JSON・アーカイブはワークスペース相対。追加引数・環境変数の `${workspaceFolder}` は `/workspace` に解決します。TAR/ZIPの展開先・除去階層数を指定できます。独自DockerfileにはPython 3.12相当の `tarfile.data_filter` が必要です。
 
-Dockerfileは空欄で内蔵のUbuntu構成を使用。独自DockerfileにはPython 3.12相当の `tarfile.data_filter` と `python3` が必要で、ビルドコンテキストには指定アーカイブだけを転送します。TARとZIPの展開先・除去する先頭階層数を指定できます。
+生成物回収・削除ソースのリモート削除は行いません。キャンセルはSSHを停止し、リモート処理の終了までは保証しません。
 
-生成物の回収と削除したソースのリモート削除は行いません。キャンセルはSSHを停止しますが、リモートビルドの終了までは保証しません。
-
-ソースからの作成: `npm install && npm run package`。ルートに `eclipse-remote-build-0.2.2.vsix` を出力します。
+ソースから作成: `npm install && npm run package`。

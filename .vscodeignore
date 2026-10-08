@@ -1,9 +1,10 @@
 **
 !package.json
 !README.md
-!dist/extension.js
-!dist/sidebar.js
+!dist/*.js
 !media/panel.html
+!media/panel.js
+!media/panel.css
 !media/eclipse-build.svg
 !docker/Dockerfile
 !docker/install-archives.py
