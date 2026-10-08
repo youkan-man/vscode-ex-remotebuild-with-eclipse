@@ -1,19 +1,13 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import { createHash, randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import { spawn } from 'node:child_process';
 
 type Archive = { source: string; destination: string; stripComponents?: number };
-type Profile = {
-  name: string;
-  project: string;
-  configuration: string;
-  eclipseWorkspace: string;
-  eclipseExecutable: string;
-  imports: string[];
-  extraArgs: string[];
-  environment: Record<string,string>;
-};
+type Profile = { name: string; profileFile?: string; project: string; configuration: string; eclipseWorkspace: string; eclipseExecutable: string; imports: string[]; extraArgs: string[]; environment: Record<string,string> };
 type Settings = {
   ssh: { host: string; port: number; user: string; identityFile: string };
   remote: { root: string; container: string; dockerCommand: string };
@@ -24,216 +18,208 @@ type Settings = {
 const defaults: Settings = {
   ssh: { host: '', port: 22, user: '', identityFile: '' },
   remote: { root: '/srv/eclipse-remote-build', container: 'eclipse-builder', dockerCommand: 'docker' },
-  sync: { include: ['.'], exclude: ['.git/', '.vscode-test/', 'node_modules/', 'dist/', '*.o', '*.a'], profileFiles: [] },
-  provision: { baseImage: 'ubuntu:24.04', image: 'eclipse-builder:local', dockerfile: 'docker/Dockerfile', archives: [] },
-  profiles: [{
-    name: 'Debug', project: 'MyProject', configuration: 'Debug',
-    eclipseWorkspace: '/tmp/eclipse-workspace', eclipseExecutable: '/opt/eclipse/eclipse',
-    imports: ['.'], extraArgs: [], environment: {}
-  }]
+  sync: { include: ['.'], exclude: ['.git/', '.local_relay/', '.vscode-test/', 'node_modules/', 'dist/', '*.o', '*.a'], profileFiles: [] },
+  provision: { baseImage: 'ubuntu:24.04', image: 'eclipse-builder:local', dockerfile: '', archives: [] },
+  profiles: [{ name: 'Debug', profileFile: '', project: 'MyProject', configuration: 'Debug', eclipseWorkspace: '/tmp/eclipse-workspace', eclipseExecutable: '/opt/eclipse/eclipse', imports: ['.'], extraArgs: [], environment: {} }]
 };
 const output = vscode.window.createOutputChannel('Eclipse Remote Build');
+let busy = false;
 function quote(s: string): string { return "'" + s.replace(/'/g, "'\\''") + "'"; }
+function text(s: unknown): s is string { return typeof s === 'string' && !/[\x00-\x1f]/.test(s); }
 function safeRel(s: string): string {
-  if (!s || path.posix.isAbsolute(s.replace(/\\/g, '/')) || /^[A-Za-z]:/.test(s)) throw Error('Workspace-relative path required: '+s);
-  const p = path.posix.normalize(s.replace(/\\/g, '/'));
-  if (p === '..' || p.startsWith('../')) throw Error('Path escapes workspace: '+s);
+  if (!text(s) || !s || path.posix.isAbsolute(s.replace(/\\/g,'/')) || /^[A-Za-z]:/.test(s)) throw Error('Workspace-relative path required: '+s);
+  const p=path.posix.normalize(s.replace(/\\/g,'/'));
+  if (p==='..' || p.startsWith('../')) throw Error('Path escapes workspace: '+s);
   return p;
 }
-function absWorkspace(root: string, rel: string): string {
-  return path.resolve(root, safeRel(rel));
+function absWorkspace(root: string, rel: string): string { return path.resolve(root,safeRel(rel)); }
+function remoteAbsolute(s: string): boolean { return text(s) && s.startsWith('/') && !s.split('/').includes('..'); }
+function validateProfile(p: Profile): void {
+  if (!p || !text(p.name) || !p.name || !text(p.project) || !p.project || !text(p.configuration) || !p.configuration) throw Error('Profile name, project and configuration are required');
+  if (!Array.isArray(p.imports) || !Array.isArray(p.extraArgs) || !p.extraArgs.every(text)) throw Error('imports and extraArgs must be string arrays');
+  p.imports.forEach(safeRel);
+  if (p.profileFile) safeRel(p.profileFile);
+  if (!remoteAbsolute(p.eclipseWorkspace) || !remoteAbsolute(p.eclipseExecutable)) throw Error('Eclipse paths must be absolute container paths');
+  if (!p.environment || Array.isArray(p.environment) || typeof p.environment!=='object') throw Error('Environment must be a JSON object');
+  for (const [k,v] of Object.entries(p.environment)) if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || typeof v!=='string' || v.includes('\0')) throw Error('Environment entries must have valid names and string values');
 }
-function validate(s: Settings): void {
-  if (!s.ssh.host || !/^[a-zA-Z0-9_][a-zA-Z0-9_.:-]*$/.test(s.ssh.host)) throw Error('Invalid SSH host');
-  if (s.ssh.user && !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(s.ssh.user)) throw Error('Invalid SSH user');
+function validate(s: Settings, execution=true): void {
+  if (!s?.ssh || !s.remote || !s.sync || !s.provision || !Array.isArray(s.profiles)) throw Error('Invalid Eclipse Remote Build settings');
+  if ((execution || s.ssh.host) && !(isIP(s.ssh.host) || /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(s.ssh.host))) throw Error('Invalid SSH host');
+  if (s.ssh.user && !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(s.ssh.user)) throw Error('Invalid SSH user');
   if (!Number.isInteger(s.ssh.port) || s.ssh.port<1 || s.ssh.port>65535) throw Error('Invalid SSH port');
-  if (!s.remote.root.startsWith('/') || path.posix.normalize(s.remote.root) === '/') throw Error('Remote root must be an absolute, non-root path');
-  if (!/^[a-zA-Z0-9_.-]+$/.test(s.remote.container)) throw Error('Invalid container name');
-  if (!/^[a-zA-Z0-9_./-]+$/.test(s.remote.dockerCommand)) throw Error('dockerCommand must be a command path');
-  s.sync.include.forEach(safeRel); s.sync.exclude.forEach(x => {if (x.startsWith('/') || x.includes('..')) throw Error('Unsafe exclude: '+x);});
-  s.sync.profileFiles.forEach(safeRel);
+  if (!text(s.ssh.identityFile)) throw Error('Invalid SSH identity file');
+  if (!remoteAbsolute(s.remote.root) || path.posix.normalize(s.remote.root)==='/') throw Error('Remote root must be an absolute, non-root path');
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(s.remote.container) || !/^(?:\/[A-Za-z0-9_./-]+|[A-Za-z0-9_][A-Za-z0-9_.-]*)$/.test(s.remote.dockerCommand)) throw Error('Invalid Docker container or executable');
+  for (const key of ['include','exclude','profileFiles'] as const) if (!Array.isArray(s.sync[key]) || !s.sync[key].every(text)) throw Error('Invalid transfer list: '+key);
+  s.sync.include.forEach(safeRel); s.sync.profileFiles.forEach(safeRel);
+  if (!text(s.provision.baseImage) || !s.provision.baseImage || !text(s.provision.image) || !s.provision.image || /\s/.test(s.provision.image+s.provision.baseImage)) throw Error('Invalid image name');
+  if (s.provision.dockerfile) safeRel(s.provision.dockerfile);
+  if (!Array.isArray(s.provision.archives)) throw Error('Invalid archive list');
   for (const a of s.provision.archives) {
-    safeRel(a.source);
-    if (!a.destination.startsWith('/') || a.destination.includes('..')) throw Error('Archive destination must be an absolute container path');
-    if (a.stripComponents !== undefined && (!Number.isInteger(a.stripComponents) || a.stripComponents < 0)) throw Error('Invalid stripComponents');
+    const rel=safeRel(a.source);
+    if (rel==='.' || rel.startsWith('.erb-') || !/\.(?:tar(?:\.(?:gz|xz|bz2))?|tgz|txz|tbz2|zip)$/i.test(rel)) throw Error('Select a TAR or ZIP archive: '+rel);
+    if (!remoteAbsolute(a.destination) || path.posix.normalize(a.destination)==='/') throw Error('Archive destination must be a non-root container directory');
+    if (a.stripComponents!==undefined && (!Number.isInteger(a.stripComponents) || a.stripComponents<0)) throw Error('Invalid stripComponents');
   }
-  s.profiles.forEach(p => {
-    if (!p.name || !p.project || !p.configuration) throw Error('Profile name, project, configuration required');
-    p.imports.forEach(safeRel);
-    if (!p.eclipseWorkspace.startsWith('/') || !p.eclipseExecutable.startsWith('/')) throw Error('Eclipse executable and workspace must be absolute paths in container');
-  });
+  s.profiles.forEach(validateProfile);
+  if (new Set(s.profiles.map(p=>p.name)).size!==s.profiles.length) throw Error('Profile names must be unique');
 }
 function workspace(): vscode.WorkspaceFolder {
-  const all = vscode.workspace.workspaceFolders;
-  if (!all?.length) throw Error('Open a folder in VS Code first');
-  if (all.length > 1) throw Error('Select a single-root workspace for now');
-  if (all[0].uri.scheme !== 'file') throw Error('Local filesystem workspace required');
+  const all=vscode.workspace.workspaceFolders;
+  if (all?.length!==1 || all[0].uri.scheme!=='file') throw Error('Open one filesystem workspace folder');
   return all[0];
 }
-function configPath(folder: vscode.WorkspaceFolder): string {
-  return absWorkspace(folder.uri.fsPath, vscode.workspace.getConfiguration('eclipseRemote').get('configFile', '.vscode/eclipse-remote-build.json'));
-}
+function configPath(folder: vscode.WorkspaceFolder): string { return absWorkspace(folder.uri.fsPath,vscode.workspace.getConfiguration('eclipseRemote',folder.uri).get('configFile','.vscode/eclipse-remote-build.json')); }
 async function load(folder: vscode.WorkspaceFolder): Promise<Settings> {
-  try { return JSON.parse(await fs.readFile(configPath(folder), 'utf8')) as Settings; }
-  catch(e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return structuredClone(defaults); throw e; }
+  try { const s=JSON.parse(await fs.readFile(configPath(folder),'utf8')) as Settings; validate(s,false); return s; }
+  catch(e) { if ((e as NodeJS.ErrnoException).code==='ENOENT') return structuredClone(defaults); throw e; }
 }
 async function save(folder: vscode.WorkspaceFolder, data: Settings): Promise<void> {
-  validate(data);
-  const dest=configPath(folder);
-  await fs.mkdir(path.dirname(dest), {recursive:true});
-  await fs.writeFile(dest, JSON.stringify(data,null,2)+'\n');
+  validate(data,false); const dest=configPath(folder);
+  await fs.mkdir(path.dirname(dest),{recursive:true}); await fs.writeFile(dest,JSON.stringify(data,null,2)+'\n');
 }
-function sshArgs(s: Settings): string[] {
-  const args=['-p',String(s.ssh.port),'-o','BatchMode=yes','-o','StrictHostKeyChecking=yes'];
-  if (s.ssh.identityFile) args.push('-i',s.ssh.identityFile);
+function sshArgs(s: Settings, root=process.cwd()): string[] {
+  const args=['-p',String(s.ssh.port),'-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=15','-o','ServerAliveInterval=15','-o','ServerAliveCountMax=3'];
+  if (s.ssh.identityFile) { let key=s.ssh.identityFile; if (key.startsWith('~/')) key=path.join(os.homedir(),key.slice(2)); else if (!path.isAbsolute(key)) key=absWorkspace(root,key); args.push('-i',key); }
   return args;
 }
-function target(s: Settings): string {return (s.ssh.user ? s.ssh.user+'@' : '')+s.ssh.host;}
-function execute(cmd: string, args: string[], cwd: string, token?: vscode.CancellationToken): Promise<void> {
-  if(token?.isCancellationRequested) return Promise.reject(new vscode.CancellationError());
-  return new Promise((resolve,reject) => {
-    output.appendLine('$ '+[cmd,...args].map(a => /password|token/i.test(a)?'[masked]':quote(a)).join(' '));
-    const child=spawn(cmd,args,{cwd,stdio:['ignore','pipe','pipe'],shell:false});
-    const cancel=token?.onCancellationRequested(()=>child.kill());
-    child.stdout.on('data',(b:Buffer)=>output.append(b.toString()));
-    child.stderr.on('data',(b:Buffer)=>output.append(b.toString()));
-    child.on('error',e=>{cancel?.dispose();reject(e);});
-    child.on('close',(code,signal)=>{cancel?.dispose();code===0?resolve():reject(Error(cmd+' failed (exit '+code+', signal '+signal+')'));});
+function target(s: Settings): string { return (s.ssh.user?s.ssh.user+'@':'')+s.ssh.host; }
+function execute(cmd: string,args: string[],cwd: string,token?: vscode.CancellationToken,capture=false): Promise<string> {
+  if (token?.isCancellationRequested) return Promise.reject(new vscode.CancellationError());
+  return new Promise((resolve,reject)=>{
+    output.appendLine('$ '+(cmd==='ssh'?'ssh [remote command]':[cmd,...args].map(quote).join(' ')));
+    const child=spawn(cmd,args,{cwd,stdio:['ignore','pipe','pipe'],shell:false}); let collected=''; let cancelled=false;
+    const cancel=token?.onCancellationRequested(()=>{cancelled=true; child.kill();});
+    child.stdout.on('data',(b: Buffer)=>{ if (capture) collected=(collected+b.toString()).slice(-1024*1024); else output.append(b.toString()); });
+    child.stderr.on('data',(b: Buffer)=>output.append(b.toString()));
+    child.once('error',e=>{cancel?.dispose(); reject(e);});
+    child.once('close',(code,signal)=>{cancel?.dispose(); if (cancelled) reject(new vscode.CancellationError()); else if(code===0) resolve(collected); else reject(Error(cmd+' failed (exit '+code+', signal '+signal+')'));});
   });
 }
-async function ssh(s:Settings, root:string, command:string, token?:vscode.CancellationToken):Promise<void> {
-  await execute('ssh',[...sshArgs(s),target(s),command],root,token);
-}
-async function transfer(s:Settings, root:string, paths:string[], remote:string, exclude:string[], token?:vscode.CancellationToken):Promise<void> {
-  const sshCmd=['ssh',...sshArgs(s)].map(quote).join(' ');
-  const args=['-az','--checksum','--protect-args','--relative','--itemize-changes','-e',sshCmd];
-  const host=s.ssh.host.includes(':') ? '['+s.ssh.host+']' : s.ssh.host;
-  const destination=(s.ssh.user ? s.ssh.user+'@' : '')+host+':'+remote+'/';
-  for(const rel of [...new Set(paths.map(safeRel))]) {
-    if(token?.isCancellationRequested) throw new vscode.CancellationError();
-    await fs.stat(absWorkspace(root,rel));
-    await execute('rsync',[...args,...exclude.flatMap(x=>['--exclude',x]),'--','./'+rel,destination],root,token);
+async function ssh(s: Settings,root: string,command: string,token?: vscode.CancellationToken,capture=false): Promise<string> { return execute('ssh',[...sshArgs(s,root),target(s),command],root,token,capture); }
+async function transfer(s: Settings,root: string,paths: string[],remote: string,exclude: string[],token?: vscode.CancellationToken): Promise<void> {
+  const shell=['ssh',...sshArgs(s,root)].map(quote).join(' ');
+  const host=s.ssh.host.includes(':')?'['+s.ssh.host+']':s.ssh.host;
+  const destination=(s.ssh.user?s.ssh.user+'@':'')+host+':'+remote+'/';
+  const base=await fs.realpath(root);
+  for (const rel of [...new Set(paths.map(safeRel))]) {
+    const real=await fs.realpath(absWorkspace(root,rel)); const inside=path.relative(base,real);
+    if (inside==='..' || inside.startsWith('..'+path.sep) || path.isAbsolute(inside)) throw Error('Source escapes workspace through symlink: '+rel);
+    await execute('rsync',['-az','--checksum','--safe-links','--protect-args','--relative','--itemize-changes','-e',shell,...exclude.flatMap(x=>['--exclude',x]),'--','./'+rel,destination],root,token);
   }
 }
-async function synchronize(s:Settings, root:string, token?:vscode.CancellationToken):Promise<void> {
-  validate(s);
-  const remote=path.posix.normalize(s.remote.root).replace(/\/$/,'');
+async function synchronize(s: Settings,root: string,token?: vscode.CancellationToken): Promise<void> {
+  validate(s); const remote=path.posix.normalize(s.remote.root).replace(/\/$/,'');
   await ssh(s,root,'mkdir -p -- '+quote(remote),token);
   await transfer(s,root,s.sync.include,remote,s.sync.exclude,token);
-  // Explicit build profiles must not be dropped by source exclusion patterns.
-  await transfer(s,root,s.sync.profileFiles,remote,[],token);
+  await transfer(s,root,[...s.sync.profileFiles,...s.profiles.flatMap(p=>p.profileFile?[p.profileFile]:[])],remote,[],token);
 }
-function containerPath(s:Settings,rel:string):string {
-  const normalized=safeRel(rel);
-  return normalized==='.' ? '/workspace/' : '/workspace/'+normalized;
+function containerPath(_s: Settings,rel: string): string { const p=safeRel(rel); return p==='.'?'/workspace/':'/workspace/'+p; }
+async function resolveProfile(p: Profile,root: string): Promise<Profile> {
+  if (!p.profileFile) return p;
+  const file=JSON.parse(await fs.readFile(absWorkspace(root,p.profileFile),'utf8'));
+  if (!file || typeof file!=='object' || Array.isArray(file)) throw Error('Build profile file must contain a JSON object');
+  const result={...p,...file,name:p.name,profileFile:p.profileFile} as Profile; validateProfile(result); return result;
 }
-async function build(s:Settings, p:Profile, root:string, token?:vscode.CancellationToken):Promise<void>{
-  const docker=s.remote.dockerCommand;
-  const args=[
-    'exec','-w','/workspace',...Object.entries(p.environment).flatMap(([k,v])=>{
-      if(!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(k)) throw Error('Invalid environment key: '+k);
-      return ['-e',k+'='+v];
-    }),s.remote.container,p.eclipseExecutable,
-    '-nosplash','-application','org.eclipse.cdt.managedbuilder.core.headlessbuild',
-    '-data',p.eclipseWorkspace,
-    ...p.imports.flatMap(x=>['-importAll',containerPath(s,x)]),
-    '-build',p.project+'/'+p.configuration,...p.extraArgs
-  ];
-  const cmd=[docker,...args].map(quote).join(' ');
-  await ssh(s,root,cmd,token);
-}
-async function provision(s:Settings,root:string,token?:vscode.CancellationToken):Promise<void>{
-  const paths=[...s.provision.archives.map(a=>a.source),s.provision.dockerfile].map(safeRel);
-  await ssh(s,root,'mkdir -p -- '+quote(s.remote.root),token);
-  await transfer(s,root,paths,s.remote.root.replace(/\/$/,''),[],token);
-  const args=[s.remote.dockerCommand,'build','-f',s.remote.root+'/'+safeRel(s.provision.dockerfile),
-    '-t',s.provision.image,'--build-arg','BASE_IMAGE='+s.provision.baseImage,s.remote.root];
+async function build(s: Settings,profile: Profile,root: string,token?: vscode.CancellationToken): Promise<void> {
+  const p=await resolveProfile(profile,root); validateProfile(p);
+  const expand=(v:string)=>v.replace(/\$\{workspaceFolder\}/g,'/workspace');
+  const args=[s.remote.dockerCommand,'exec','-w','/workspace',...Object.entries(p.environment).flatMap(([k,v])=>['-e',k+'='+expand(v)]),s.remote.container,p.eclipseExecutable,'-nosplash','-application','org.eclipse.cdt.managedbuilder.core.headlessbuild','-data',p.eclipseWorkspace,...p.imports.flatMap(x=>['-importAll',containerPath(s,x)]),'-build',p.project+'/'+p.configuration,...p.extraArgs.map(expand)];
+  output.appendLine('Eclipse: '+p.project+' / '+p.configuration);
   await ssh(s,root,args.map(quote).join(' '),token);
 }
-async function operation(action:'build'|'sync'|'provision') {
-  const folder=workspace(),s=await load(folder);
+async function provision(s: Settings,root: string,token?: vscode.CancellationToken): Promise<void> {
   validate(s);
-  let profile:Profile|undefined;
-  if(action==='build'){
-    const chosen=await vscode.window.showQuickPick(s.profiles.map(p=>p.name),{placeHolder:'Select Eclipse build profile'});
-    if(!chosen) return;
-    profile=s.profiles.find(p=>p.name===chosen);
-  }
-  output.show(true);
-  await vscode.window.withProgress({location:vscode.ProgressLocation.Notification,title:'Eclipse Remote Build: '+action,cancellable:true},async(_progress,token)=>{
-    if(action==='provision') await provision(s,folder.uri.fsPath,token);
-    else { await synchronize(s,folder.uri.fsPath,token);if(profile)await build(s,profile,folder.uri.fsPath,token); }
-  });
-  vscode.window.showInformationMessage('Eclipse Remote Build: '+action+' completed');
+  const bundled=path.resolve(__dirname,'../docker');
+  const base=await fs.readFile(s.provision.dockerfile?absWorkspace(root,s.provision.dockerfile):path.join(bundled,'Dockerfile'),'utf8');
+  const tag=createHash('sha256').update(JSON.stringify([root,s.provision,base])).digest('hex').slice(0,16);
+  const remote=path.posix.normalize(s.remote.root).replace(/\/$/,'')+'.erb-context/'+tag;
+  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'eclipse-image-'));
+  try {
+    const manifest=s.provision.archives.map((a,i)=>({...a,source:String(i)+'/'+path.posix.basename(safeRel(a.source))}));
+    const copy=s.provision.archives.map((a,i)=>'COPY '+JSON.stringify([safeRel(a.source),'/tmp/.erb-archives/'+manifest[i].source])).join('\n');
+    const dockerfile=base+'\nUSER root\nCOPY [".erb-install.py", "/tmp/.erb-install.py"]\nCOPY [".erb-archives.json", "/tmp/.erb-archives.json"]\n'+copy+'\nRUN python3 /tmp/.erb-install.py /tmp/.erb-archives.json /tmp/.erb-archives && rm -rf /tmp/.erb-install.py /tmp/.erb-archives.json /tmp/.erb-archives\nWORKDIR /workspace\nCMD ["sleep", "infinity"]\n';
+    await fs.writeFile(path.join(temp,'.erb-Dockerfile'),dockerfile);
+    await fs.writeFile(path.join(temp,'.erb-archives.json'),JSON.stringify(manifest));
+    await fs.copyFile(path.join(bundled,'install-archives.py'),path.join(temp,'.erb-install.py'));
+    await ssh(s,root,'mkdir -p -- '+quote(remote),token);
+    const upload=structuredClone(s);
+    if (upload.ssh.identityFile && !path.isAbsolute(upload.ssh.identityFile) && !upload.ssh.identityFile.startsWith('~/')) upload.ssh.identityFile=absWorkspace(root,upload.ssh.identityFile);
+    await transfer(upload,temp,['.'],remote,[],token);
+    await transfer(s,root,s.provision.archives.map(a=>a.source),remote,[],token);
+    await ssh(s,root,[s.remote.dockerCommand,'build','-f',remote+'/.erb-Dockerfile','--build-arg','BASE_IMAGE='+s.provision.baseImage,'-t',s.provision.image,remote].map(quote).join(' '),token);
+  } finally { await fs.rm(temp,{recursive:true,force:true}); }
 }
-function page(data:Settings):string {
-  const nonce=Math.random().toString(36).slice(2);
-  const json=JSON.stringify(data).replace(/</g,'\\u003c');
-  return `<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'"><style nonce="${nonce}">
-  :root{color-scheme:light dark}body{font:13px var(--vscode-font-family);padding:20px;max-width:1050px;margin:auto;color:var(--vscode-foreground)}
-  h1{font-size:22px}h2{font-size:15px;margin-top:0}section{border:1px solid var(--vscode-panel-border);padding:16px;margin:14px 0;border-radius:5px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:5px}
-  label{font-weight:600}input,textarea{font:inherit;box-sizing:border-box;width:100%;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);padding:7px}
-  button{padding:8px 14px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:0;cursor:pointer;margin-right:8px}
-  .secondary{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
-  .toolbar{position:sticky;top:0;padding:10px;background:var(--vscode-editor-background);border-bottom:1px solid var(--vscode-panel-border);z-index:1}
-  .hint{opacity:.75;margin:6px 0 12px}textarea{min-height:65px}#error{color:var(--vscode-errorForeground);white-space:pre-wrap}
-  </style></head><body><h1>Eclipse Remote Build</h1><p class="hint">Workspace-relative paths for sync, imports, archives and Dockerfile. One entry per line for lists.</p>
-  <div class="toolbar"><button id="save">Save configuration</button><button id="sync">Sync</button><button id="build">Sync &amp; Build</button><button id="provision">Provision image</button><span id="error"></span></div>
-  <main id="app"></main>
-  <script nonce="${nonce}">
-  const vscode=acquireVsCodeApi();let data=${json};
-  const app=document.getElementById('app');
-  const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  function field(label,path,type='text'){let value=path.split('.').reduce((o,k)=>o?.[k],data)??'';return '<div class="field"><label>'+esc(label)+'</label><input data-path="'+esc(path)+'" type="'+type+'" value="'+esc(value)+'"></div>'}
-  function list(label,path){let arr=path.split('.').reduce((o,k)=>o?.[k],data)||[];return '<div class="field"><label>'+esc(label)+'</label><textarea data-list="'+esc(path)+'">'+esc(arr.join('\\n'))+'</textarea></div>'}
-  function set(path,value){let keys=path.split('.'),cur=data;for(let i=0;i<keys.length-1;i++)cur=cur[keys[i]];cur[keys.at(-1)]=value}
-  function draw(){
-   app.innerHTML='<section><h2>SSH destination</h2><div class="grid">'+field('Host','ssh.host')+field('Username','ssh.user')+field('Port','ssh.port','number')+field('SSH identity file (local)','ssh.identityFile')+'</div></section>'+
-   '<section><h2>Remote Docker environment</h2><div class="grid">'+field('Host workspace path','remote.root')+field('Container name','remote.container')+field('Docker executable','remote.dockerCommand')+'</div></section>'+
-   '<section><h2>Incremental transfer</h2><div class="grid">'+list('Include paths','sync.include')+list('Exclude patterns','sync.exclude')+list('Workspace profile files','sync.profileFiles')+'</div></section>'+
-   '<section><h2>Container image provisioning</h2><div class="grid">'+field('Base image','provision.baseImage')+field('Image tag','provision.image')+field('Dockerfile (workspace relative)','provision.dockerfile')+'</div><div id="archives"></div><button class="secondary" id="addArchive">+ Archive</button></section>'+
-   '<section><h2>Build profiles</h2><div id="profiles"></div><button class="secondary" id="addProfile">+ Profile</button></section>';
-   drawLists();
+async function startContainer(s: Settings,root: string,token?: vscode.CancellationToken,replace=false): Promise<boolean> {
+  const docker=(args:string[],capture=false)=>ssh(s,root,[s.remote.dockerCommand,...args].map(quote).join(' '),token,capture);
+  const names=(await docker(['container','ls','-a','--format','{{.Names}}'],true)).trim().split(/\r?\n/);
+  if (names.includes(s.remote.container)) {
+    const [c]=JSON.parse(await docker(['container','inspect',s.remote.container],true));
+    const image=(await docker(['image','inspect','--format','{{.Id}}',s.provision.image],true)).trim();
+    const mount=c.Mounts?.find((m:{Destination:string})=>m.Destination==='/workspace');
+    if (c.Image===image && mount?.Source===path.posix.normalize(s.remote.root).replace(/\/$/,'')) { if(!c.State.Running) await docker(['start',s.remote.container]); return true; }
+    if (!replace) return false;
+    await docker(['rm','-f',s.remote.container]);
   }
-  function drawLists(){
-   document.getElementById('archives').innerHTML=data.provision.archives.map((a,i)=>'<div class="grid" style="margin:12px 0"><div class="field"><label>Archive '+(i+1)+' (relative)</label><input data-archive="'+i+'" data-key="source" value="'+esc(a.source)+'"></div><div class="field"><label>Unpack destination (container)</label><input data-archive="'+i+'" data-key="destination" value="'+esc(a.destination)+'"></div><div class="field"><label>Strip components</label><input type="number" min="0" data-archive="'+i+'" data-key="stripComponents" value="'+esc(a.stripComponents??0)+'"></div><button class="secondary" data-remove-archive="'+i+'">Remove</button></div>').join('');
-   document.getElementById('profiles').innerHTML=data.profiles.map((p,i)=>'<article style="border-top:1px solid var(--vscode-panel-border);margin:14px 0;padding-top:14px"><div class="grid">'+
-    ['name','project','configuration','eclipseWorkspace','eclipseExecutable'].map(k=>'<div class="field"><label>'+esc(k)+'</label><input data-profile="'+i+'" data-key="'+k+'" value="'+esc(p[k])+'"></div>').join('')+
-    ['imports','extraArgs'].map(k=>'<div class="field"><label>'+esc(k)+' (one per line)</label><textarea data-profile="'+i+'" data-key="'+k+'" data-kind="list">'+esc(p[k].join('\\n'))+'</textarea></div>').join('')+
-    '<div class="field"><label>Environment (JSON object)</label><textarea data-profile="'+i+'" data-key="environment" data-kind="json">'+esc(JSON.stringify(p.environment,null,2))+'</textarea></div></div><button class="secondary" data-remove-profile="'+i+'">Remove profile</button></article>').join('');
-  }
-  app.addEventListener('input',e=>{
-   let t=e.target;if(t.dataset.path)set(t.dataset.path,t.type==='number'?Number(t.value):t.value);
-   if(t.dataset.list)set(t.dataset.list,t.value.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean));
-   if(t.dataset.archive!==undefined){let k=t.dataset.key;data.provision.archives[Number(t.dataset.archive)][k]=k==='stripComponents'?Number(t.value):t.value;}
-   if(t.dataset.profile!==undefined){let k=t.dataset.key,p=data.profiles[Number(t.dataset.profile)];if(t.dataset.kind==='list')p[k]=t.value.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean);else if(t.dataset.kind==='json'){try{p[k]=JSON.parse(t.value);document.getElementById('error').textContent=''}catch(e){document.getElementById('error').textContent=e.message}}else p[k]=t.value;}
-  });
-  app.addEventListener('click',e=>{let t=e.target;if(t.id==='addArchive')data.provision.archives.push({source:'toolchain.tar.gz',destination:'/opt/toolchain',stripComponents:0});else if(t.id==='addProfile')data.profiles.push({name:'Release',project:'MyProject',configuration:'Release',eclipseWorkspace:'/tmp/eclipse-workspace',eclipseExecutable:'/opt/eclipse/eclipse',imports:['.'],extraArgs:[],environment:{}});else if(t.dataset.removeArchive!==undefined)data.provision.archives.splice(Number(t.dataset.removeArchive),1);else if(t.dataset.removeProfile!==undefined)data.profiles.splice(Number(t.dataset.removeProfile),1);else return;drawLists();});
-  for(const act of ['save','sync','build','provision'])document.getElementById(act).addEventListener('click',()=>vscode.postMessage({action:act,data}));
-  window.addEventListener('message',e=>{document.getElementById('error').textContent=e.data.error??e.data.info??''});
-  draw();
-  </script></body></html>`;
+  await ssh(s,root,'mkdir -p -- '+quote(s.remote.root),token);
+  const source=path.posix.normalize(s.remote.root).replace(/\/$/,'');
+  const mount='type=bind,"source='+source.replace(/"/g,'""')+'",target=/workspace';
+  await docker(['run','-d','--name',s.remote.container,'--label','eclipse-remote-build=managed','--mount',mount,'-w','/workspace',s.provision.image]);
+  return true;
 }
-export function activate(context:vscode.ExtensionContext){
+type Action='build'|'sync'|'provision';
+async function operation(action: Action,folder=workspace(),selectedName?: string): Promise<void> {
+  if (!vscode.workspace.isTrusted) throw Error('Trust this workspace before running remote commands');
+  if (busy) throw Error('An Eclipse Remote Build operation is already running');
+  const s=await load(folder); validate(s); let profile: Profile|undefined;
+  if (action==='build') {
+    const name=selectedName || await vscode.window.showQuickPick(s.profiles.map(p=>p.name),{placeHolder:'Select Eclipse build profile'});
+    if (!name) return; profile=s.profiles.find(p=>p.name===name); if(!profile) throw Error('Build profile not found');
+    await resolveProfile(profile,folder.uri.fsPath);
+  }
+  busy=true; output.show(true);
+  try {
+    await vscode.window.withProgress({location:vscode.ProgressLocation.Notification,title:'Eclipse Remote Build: '+action,cancellable:true},async(_progress,token)=>{
+      if (action==='provision') {
+        await provision(s,folder.uri.fsPath,token);
+        if (!await startContainer(s,folder.uri.fsPath,token)) {
+          const choice=await vscode.window.showWarningMessage('コンテナのイメージまたはマウントが異なります。再作成するとコンテナ内だけの変更は失われます。ワークスペースは保持します。',{modal:true},'再作成');
+          if (choice!=='再作成') throw Error('Image built; existing container was not replaced');
+          await startContainer(s,folder.uri.fsPath,token,true);
+        }
+      } else { await synchronize(s,folder.uri.fsPath,token); if(profile) await build(s,profile,folder.uri.fsPath,token); }
+    });
+    output.appendLine('Completed: '+action);
+  } finally { busy=false; }
+}
+async function page(data: Settings): Promise<string> {
+  const template=await fs.readFile(path.resolve(__dirname,'../media/panel.html'),'utf8');
+  return template.replace(/__NONCE__/g,randomBytes(18).toString('hex')).replace('__DATA__',()=>JSON.stringify(data).replace(/</g,'\\u003c'));
+}
+async function pick(folder: vscode.WorkspaceFolder): Promise<string|undefined> {
+  const chosen=await vscode.window.showOpenDialog({defaultUri:folder.uri,canSelectFiles:true,canSelectFolders:false,canSelectMany:false});
+  return chosen?.[0] ? safeRel(path.relative(folder.uri.fsPath,chosen[0].fsPath)) : undefined;
+}
+export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(output);
   context.subscriptions.push(vscode.commands.registerCommand('eclipseRemote.configure',async()=>{
-    try{
-      const folder=workspace(),panel=vscode.window.createWebviewPanel('eclipseRemote','Eclipse Remote Build',vscode.ViewColumn.One,{enableScripts:true,retainContextWhenHidden:true});
-      panel.webview.html=page(await load(folder));
-      panel.webview.onDidReceiveMessage(async(msg:{action:string;data:Settings})=>{
-        try{
-          await save(folder,msg.data);
-          panel.webview.postMessage({info:'Configuration saved'});
-          if(['sync','build','provision'].includes(msg.action))await operation(msg.action as 'sync'|'build'|'provision');
-        }catch(e){panel.webview.postMessage({error:String(e)});vscode.window.showErrorMessage(String(e));}
+    try {
+      const folder=workspace(); const panel=vscode.window.createWebviewPanel('eclipseRemote','Eclipse Remote Build',vscode.ViewColumn.One,{enableScripts:true,localResourceRoots:[],retainContextWhenHidden:true});
+      panel.webview.html=await page(await load(folder));
+      const subscription=panel.webview.onDidReceiveMessage(async(msg:{action:string;data:Settings;field?:string;profile?:string})=>{
+        try {
+          if (msg.action==='pick') { const value=await pick(folder); if(value) await panel.webview.postMessage({field:msg.field,value}); return; }
+          if (!['save','sync','build','provision'].includes(msg.action)) return;
+          await panel.webview.postMessage({busy:true}); await save(folder,msg.data);
+          if(msg.action!=='save') await operation(msg.action as Action,folder,msg.profile);
+          await panel.webview.postMessage({info:msg.action==='save'?'設定を保存しました':'完了しました'});
+        } catch(e) { await panel.webview.postMessage({error:String(e)}); output.appendLine(String(e)); }
+        finally { await panel.webview.postMessage({busy:false}); }
       });
-    }catch(e){vscode.window.showErrorMessage(String(e));}
+      panel.onDidDispose(()=>subscription.dispose());
+    } catch(e) { void vscode.window.showErrorMessage(String(e)); }
   }));
-  for(const action of ['build','sync','provision'] as const){
-    context.subscriptions.push(vscode.commands.registerCommand('eclipseRemote.'+action,async()=>{
-      try{await operation(action);}catch(e){output.show(true);vscode.window.showErrorMessage(String(e));}
-    }));
-  }
+  for(const action of ['build','sync','provision'] as const) context.subscriptions.push(vscode.commands.registerCommand('eclipseRemote.'+action,async()=>{try{await operation(action);}catch(e){output.show(true);void vscode.window.showErrorMessage(String(e));}}));
 }
-export function deactivate(){}
+export function deactivate(): void {}

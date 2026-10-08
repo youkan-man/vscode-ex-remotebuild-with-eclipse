@@ -2,61 +2,25 @@
   "name": "eclipse-remote-build",
   "displayName": "Eclipse Remote Build",
   "description": "Workspace-relative incremental SSH sync and Docker Eclipse CDT builds",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "youkan-man",
-  "engines": {
-    "vscode": "^1.90.0"
-  },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [
-    "onCommand:eclipseRemote.configure",
-    "onCommand:eclipseRemote.build",
-    "onCommand:eclipseRemote.sync",
-    "onCommand:eclipseRemote.provision"
-  ],
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
   "main": "./dist/extension.js",
+  "capabilities": { "untrustedWorkspaces": { "supported": false } },
+  "repository": { "type": "git", "url": "https://github.com/youkan-man/vscode-ex-remotebuild-with-eclipse.git" },
   "contributes": {
     "commands": [
-      {
-        "command": "eclipseRemote.configure",
-        "title": "Eclipse Remote Build: Configure"
-      },
-      {
-        "command": "eclipseRemote.build",
-        "title": "Eclipse Remote Build: Sync and Build"
-      },
-      {
-        "command": "eclipseRemote.sync",
-        "title": "Eclipse Remote Build: Sync Only"
-      },
-      {
-        "command": "eclipseRemote.provision",
-        "title": "Eclipse Remote Build: Provision Container"
-      }
+      { "command": "eclipseRemote.configure", "title": "Eclipse Remote Build: Configure" },
+      { "command": "eclipseRemote.build", "title": "Eclipse Remote Build: Sync and Build" },
+      { "command": "eclipseRemote.sync", "title": "Eclipse Remote Build: Sync Only" },
+      { "command": "eclipseRemote.provision", "title": "Eclipse Remote Build: Provision and Start Container" }
     ],
     "configuration": {
       "title": "Eclipse Remote Build",
-      "properties": {
-        "eclipseRemote.configFile": {
-          "type": "string",
-          "default": ".vscode/eclipse-remote-build.json",
-          "description": "Workspace-relative profile settings file"
-        }
-      }
+      "properties": { "eclipseRemote.configFile": { "type": "string", "default": ".vscode/eclipse-remote-build.json", "description": "Workspace-relative settings file", "scope": "resource" } }
     }
   },
-  "scripts": {
-    "compile": "tsc -p .",
-    "watch": "tsc -watch -p .",
-    "package": "npm run compile && vsce package",
-    "check": "tsc --noEmit -p ."
-  },
-  "devDependencies": {
-    "@types/node": "^22.0.0",
-    "@types/vscode": "^1.90.0",
-    "typescript": "^5.7.3",
-    "@vscode/vsce": "^3.2.0"
-  }
+  "scripts": { "compile": "tsc -p .", "watch": "tsc --watch -p .", "check": "tsc --noEmit -p .", "package": "npm run compile && vsce package --no-dependencies" },
+  "devDependencies": { "@types/node": "^22.0.0", "@types/vscode": "1.90.0", "typescript": "^5.7.3", "@vscode/vsce": "^3.2.0" }
 }

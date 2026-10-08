@@ -1,0 +1,7 @@
+**
+!package.json
+!README.md
+!dist/extension.js
+!media/panel.html
+!docker/Dockerfile
+!docker/install-archives.py
