@@ -1,45 +1,32 @@
 import * as vscode from 'vscode';
-
-class BuildActions implements vscode.TreeDataProvider<vscode.TreeItem>, vscode.Disposable {
-  private readonly changed = new vscode.EventEmitter<void>();
-  readonly onDidChangeTreeData = this.changed.event;
-
-  refresh(): void { this.changed.fire(); }
-  dispose(): void { this.changed.dispose(); }
-  getTreeItem(item: vscode.TreeItem): vscode.TreeItem { return item; }
-
-  getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
-    if (element || !vscode.workspace.workspaceFolders?.length) return [];
-    return [
-      this.action('設定を開く', 'configure', 'settings-gear', 'SSH接続・転送対象・Eclipse・ビルドプロファイルを設定'),
-      this.action('Dockerへデプロイ', 'deploy', 'vm', '設定したアーカイブからイメージを構築し、コンテナを起動'),
-      this.action('同期のみ', 'sync', 'sync', 'ソースとプロファイルを差分転送'),
-      this.action('同期してビルド', 'build', 'tools', 'プロファイルを選んで差分転送とEclipseビルドを実行'),
-      this.action('ログを表示', 'showOutput', 'output', 'Eclipse Remote Buildの出力を表示')
-    ];
-  }
-
-  private action(label: string, name: string, icon: string, tooltip: string): vscode.TreeItem {
-    const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
-    item.id = 'eclipseRemote.' + name;
-    item.command = { command: item.id, title: label };
-    item.iconPath = new vscode.ThemeIcon(icon);
-    item.tooltip = tooltip;
-    return item;
-  }
-}
-
-export function registerSidebar(context: vscode.ExtensionContext): void {
-  const provider = new BuildActions();
-  const view = vscode.window.createTreeView('eclipseRemote.actions', {
-    treeDataProvider: provider,
-    showCollapseAll: false,
-    canSelectMany: false
-  });
-  const update = () => {
-    view.description = vscode.workspace.workspaceFolders?.map(folder => folder.name).join(', ');
-    provider.refresh();
+export type SidebarState = { host: string; container: string; profile: string; configuration: string; status: string; dirty: boolean; conflict: boolean; busy: boolean };
+export function registerSidebar(context: vscode.ExtensionContext, state: () => SidebarState | undefined): () => void {
+  const changed = new vscode.EventEmitter<void>();
+  const item = (label: string, icon: string, command?: string, description?: string) => {
+    const row = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+    row.id = label; row.iconPath = new vscode.ThemeIcon(icon); row.description = description;
+    row.tooltip = description ? label + ': ' + description : label;
+    if (command) row.command = { command: 'eclipseRemote.' + command, title: label };
+    return row;
   };
-  context.subscriptions.push(provider, view, vscode.workspace.onDidChangeWorkspaceFolders(update));
-  update();
+  const provider: vscode.TreeDataProvider<vscode.TreeItem> = {
+    onDidChangeTreeData: changed.event, getTreeItem: row => row,
+    getChildren: parent => {
+      if (parent || !vscode.workspace.workspaceFolders?.length) return [];
+      const s = state();
+      return [
+        item('接続先', 'remote', 'configure', s?.host || '未設定'),
+        item('プロファイル', 'list-selection', 'selectProfile', s?.profile || '未選択'),
+        item('適用構成', 'symbol-property', undefined, s?.configuration || '—'),
+        item(s?.conflict ? '設定ファイルが更新されています' : s?.dirty ? '未保存の設定' : '保存済みの設定', s?.dirty ? 'circle-filled' : 'check'),
+        item(s?.status || '待機', s?.busy ? 'loading~spin' : 'info'),
+        item('同期してビルド', 'tools', 'build'), item('同期のみ', 'sync', 'sync'),
+        item('Dockerへデプロイ', 'vm', 'deploy', s?.container),
+        item('設定を開く', 'settings-gear', 'configure'), item('ログを表示', 'output', 'showOutput')
+      ];
+    }
+  };
+  const view = vscode.window.createTreeView('eclipseRemote.actions', { treeDataProvider: provider, showCollapseAll: false });
+  context.subscriptions.push(changed, view);
+  return () => changed.fire();
 }
