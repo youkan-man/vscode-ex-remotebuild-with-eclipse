@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { spawn } from 'node:child_process';
+import { registerSidebar } from './sidebar';
 
 type Archive = { source: string; destination: string; stripComponents?: number };
 type Profile = { name: string; profileFile?: string; project: string; configuration: string; eclipseWorkspace: string; eclipseExecutable: string; imports: string[]; extraArgs: string[]; environment: Record<string,string> };
@@ -24,6 +25,12 @@ const defaults: Settings = {
 };
 const output = vscode.window.createOutputChannel('Eclipse Remote Build');
 let busy = false;
+let configurationPanel: vscode.WebviewPanel | undefined;
+function revealConfigurationPanel(): boolean {
+  if (!configurationPanel) return false;
+  configurationPanel.reveal();
+  return true;
+}
 function quote(s: string): string { return "'" + s.replace(/'/g, "'\\''") + "'"; }
 function text(s: unknown): s is string { return typeof s === 'string' && !/[\x00-\x1f]/.test(s); }
 function safeRel(s: string): string {
@@ -235,10 +242,18 @@ async function pick(folder: vscode.WorkspaceFolder): Promise<string|undefined> {
 }
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(output);
+  registerSidebar(context);
+  context.subscriptions.push(vscode.commands.registerCommand('eclipseRemote.showOutput',()=>output.show(true)));
   context.subscriptions.push(vscode.commands.registerCommand('eclipseRemote.configure',async()=>{
     try {
-      const folder=workspace(); const panel=vscode.window.createWebviewPanel('eclipseRemote','Eclipse Remote Build',vscode.ViewColumn.One,{enableScripts:true,localResourceRoots:[],retainContextWhenHidden:true});
-      panel.webview.html=await page(await load(folder));
+      const folder=workspace();
+      if (revealConfigurationPanel()) return;
+      const html=await page(await load(folder));
+      // A second request may have opened the panel while its HTML was loading.
+      if (revealConfigurationPanel()) return;
+      const panel=vscode.window.createWebviewPanel('eclipseRemote','Eclipse Remote Build',vscode.ViewColumn.One,{enableScripts:true,localResourceRoots:[],retainContextWhenHidden:true});
+      configurationPanel=panel;
+      panel.webview.html=html;
       const subscription=panel.webview.onDidReceiveMessage(async(msg:{action:string;data:Settings;field?:string;profile?:string})=>{
         try {
           if (msg.action==='pick') { const value=await pick(folder); if(value) await panel.webview.postMessage({field:msg.field,value}); return; }
@@ -249,7 +264,7 @@ export function activate(context: vscode.ExtensionContext): void {
         } catch(e) { await panel.webview.postMessage({error:String(e)}); output.appendLine(String(e)); }
         finally { await panel.webview.postMessage({busy:false}); }
       });
-      panel.onDidDispose(()=>subscription.dispose());
+      panel.onDidDispose(()=>{subscription.dispose();if(configurationPanel===panel)configurationPanel=undefined;});
     } catch(e) { void vscode.window.showErrorMessage(String(e)); }
   }));
   for(const action of ['build','sync','deploy','provision'] as const) context.subscriptions.push(vscode.commands.registerCommand('eclipseRemote.'+action,async()=>{

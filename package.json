@@ -2,12 +2,12 @@
   "name": "eclipse-remote-build",
   "displayName": "Eclipse Remote Build",
   "description": "Workspace-relative incremental SSH sync and Docker Eclipse CDT builds",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "youkan-man",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
   "main": "./dist/extension.js",
-  "activationEvents": ["onCommand:eclipseRemote.provision"],
+  "activationEvents": ["onCommand:eclipseRemote.provision", "onView:eclipseRemote.actions"],
   "capabilities": { "untrustedWorkspaces": { "supported": false } },
   "repository": { "type": "git", "url": "https://github.com/youkan-man/vscode-ex-remotebuild-with-eclipse.git" },
   "contributes": {
@@ -15,8 +15,20 @@
       { "command": "eclipseRemote.configure", "title": "Eclipse Remote Build: Configure" },
       { "command": "eclipseRemote.build", "title": "Eclipse Remote Build: Sync and Build" },
       { "command": "eclipseRemote.sync", "title": "Eclipse Remote Build: Sync Only" },
-      { "command": "eclipseRemote.deploy", "title": "Eclipse Remote Build: Dockerへデプロイ" }
+      { "command": "eclipseRemote.deploy", "title": "Eclipse Remote Build: Dockerへデプロイ" },
+      { "command": "eclipseRemote.showOutput", "title": "Eclipse Remote Build: ログを表示" }
     ],
+    "viewsContainers": {
+      "activitybar": [{ "id": "eclipseRemote", "title": "Eclipse Build", "icon": "media/eclipse-build.svg" }]
+    },
+    "views": {
+      "eclipseRemote": [{ "id": "eclipseRemote.actions", "name": "リモートビルド", "contextualTitle": "Eclipse Build", "icon": "media/eclipse-build.svg" }]
+    },
+    "viewsWelcome": [{
+      "view": "eclipseRemote.actions",
+      "contents": "ビルドするワークスペースのフォルダーを開いてください。\n[フォルダーを開く](command:vscode.openFolder)",
+      "when": "workbenchState == empty"
+    }],
     "configuration": {
       "title": "Eclipse Remote Build",
       "properties": { "eclipseRemote.configFile": { "type": "string", "default": ".vscode/eclipse-remote-build.json", "description": "Workspace-relative settings file", "scope": "resource" } }
