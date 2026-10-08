@@ -151,14 +151,33 @@ async function provision(s: Settings,root: string,token?: vscode.CancellationTok
     await ssh(s,root,[s.remote.dockerCommand,'build','-f',remote+'/.erb-Dockerfile','--build-arg','BASE_IMAGE='+s.provision.baseImage,'-t',s.provision.image,remote].map(quote).join(' '),token);
   } finally { await fs.rm(temp,{recursive:true,force:true}); }
 }
+type ContainerInfo = {
+  Id: string; Image: string; State: { Running: boolean; Status: string };
+  Mounts: { Destination: string; Source: string; Type: string; RW: boolean }[];
+};
+async function inspectContainer(s: Settings,root: string,token?: vscode.CancellationToken): Promise<ContainerInfo> {
+  const result=await ssh(s,root,[s.remote.dockerCommand,'container','inspect',s.remote.container].map(quote).join(' '),token,true);
+  const [container]=JSON.parse(result) as ContainerInfo[];
+  if (!container?.Id || !container.State || !Array.isArray(container.Mounts)) throw Error('Docker returned an invalid container description');
+  return container;
+}
+function workspaceMounted(s: Settings,c: ContainerInfo): boolean {
+  return c.Mounts.some(m=>m.Destination==='/workspace' && m.Type==='bind' && m.RW && m.Source===path.posix.normalize(s.remote.root).replace(/\/$/,''));
+}
+async function verifyDeployment(s: Settings,root: string,token?: vscode.CancellationToken): Promise<string> {
+  const c=await inspectContainer(s,root,token);
+  if (!c.State.Running) throw Error('Dockerコンテナが起動していません: '+c.State.Status);
+  if (!workspaceMounted(s,c)) throw Error('Dockerの /workspace マウントが設定と一致しないか、書き込み不可です');
+  await ssh(s,root,[s.remote.dockerCommand,'exec',s.remote.container,'/bin/sh','-c','test -d /workspace && test -w /workspace'].map(quote).join(' '),token);
+  return 'Dockerデプロイ完了: '+s.remote.container+' / 起動中 / '+c.Id.slice(0,12);
+}
 async function startContainer(s: Settings,root: string,token?: vscode.CancellationToken,replace=false): Promise<boolean> {
   const docker=(args:string[],capture=false)=>ssh(s,root,[s.remote.dockerCommand,...args].map(quote).join(' '),token,capture);
   const names=(await docker(['container','ls','-a','--format','{{.Names}}'],true)).trim().split(/\r?\n/);
   if (names.includes(s.remote.container)) {
-    const [c]=JSON.parse(await docker(['container','inspect',s.remote.container],true));
+    const c=await inspectContainer(s,root,token);
     const image=(await docker(['image','inspect','--format','{{.Id}}',s.provision.image],true)).trim();
-    const mount=c.Mounts?.find((m:{Destination:string})=>m.Destination==='/workspace');
-    if (c.Image===image && mount?.Source===path.posix.normalize(s.remote.root).replace(/\/$/,'')) { if(!c.State.Running) await docker(['start',s.remote.container]); return true; }
+    if (c.Image===image && workspaceMounted(s,c)) { if(!c.State.Running) await docker(['start',s.remote.container]); return true; }
     if (!replace) return false;
     await docker(['rm','-f',s.remote.container]);
   }
@@ -168,8 +187,8 @@ async function startContainer(s: Settings,root: string,token?: vscode.Cancellati
   await docker(['run','-d','--name',s.remote.container,'--label','eclipse-remote-build=managed','--mount',mount,'-w','/workspace',s.provision.image]);
   return true;
 }
-type Action='build'|'sync'|'provision';
-async function operation(action: Action,folder=workspace(),selectedName?: string): Promise<void> {
+type Action='build'|'sync'|'deploy'|'provision';
+async function operation(action: Action,folder=workspace(),selectedName?: string,report:(message:string)=>void=()=>{}): Promise<string|undefined> {
   if (!vscode.workspace.isTrusted) throw Error('Trust this workspace before running remote commands');
   if (busy) throw Error('An Eclipse Remote Build operation is already running');
   busy=true;
@@ -180,23 +199,35 @@ async function operation(action: Action,folder=workspace(),selectedName?: string
       if (!name) return; profile=s.profiles.find(p=>p.name===name); if(!profile) throw Error('Build profile not found');
       await resolveProfile(profile,folder.uri.fsPath);
     }
-    output.show(true);
-    await vscode.window.withProgress({location:vscode.ProgressLocation.Notification,title:'Eclipse Remote Build: '+action,cancellable:true},async(_progress,token)=>{
-      if (action==='provision') {
+    const deploying=action==='deploy'||action==='provision';
+    let result='完了しました'; output.show(true);
+    await vscode.window.withProgress({location:vscode.ProgressLocation.Notification,title:deploying?'Eclipse Remote Build: Dockerへデプロイ':'Eclipse Remote Build: '+action,cancellable:true},async(progress,token)=>{
+      const phase=(message:string)=>{progress.report({message});report(message);output.appendLine(message);};
+      if (deploying) {
+        phase('1/3 アーカイブ転送・Dockerイメージ構築');
         await provision(s,folder.uri.fsPath,token);
+        phase('2/3 Dockerコンテナの作成・起動');
         if (!await startContainer(s,folder.uri.fsPath,token)) {
           const choice=await vscode.window.showWarningMessage('コンテナのイメージまたはマウントが異なります。再作成するとコンテナ内だけの変更は失われます。ワークスペースは保持します。',{modal:true},'再作成');
           if (choice!=='再作成') throw Error('Image built; existing container was not replaced');
           await startContainer(s,folder.uri.fsPath,token,true);
         }
-      } else { await synchronize(s,folder.uri.fsPath,token); if(profile) await build(s,profile,folder.uri.fsPath,token); }
+        phase('3/3 起動状態・ワークスペースマウント確認');
+        result=await verifyDeployment(s,folder.uri.fsPath,token);
+      } else {
+        phase('ソース・プロファイルを差分転送');
+        await synchronize(s,folder.uri.fsPath,token);
+        if(profile) {phase('Eclipseでビルド');await build(s,profile,folder.uri.fsPath,token);}
+        result=profile?'ビルド完了':'同期完了';
+      }
     });
-    output.appendLine('Completed: '+action);
+    output.appendLine(result); return result;
   } finally { busy=false; }
 }
 async function page(data: Settings): Promise<string> {
   const template=await fs.readFile(path.resolve(__dirname,'../media/panel.html'),'utf8');
-  return template.replace(/__NONCE__/g,randomBytes(18).toString('hex')).replace('__DATA__',()=>JSON.stringify(data).replace(/</g,'\\u003c'));
+  const manifest=JSON.parse(await fs.readFile(path.resolve(__dirname,'../package.json'),'utf8'));
+  return template.replace(/__NONCE__/g,randomBytes(18).toString('hex')).replace('__VERSION__',String(manifest.version)).replace('__DATA__',()=>JSON.stringify(data).replace(/</g,'\\u003c'));
 }
 async function pick(folder: vscode.WorkspaceFolder): Promise<string|undefined> {
   const chosen=await vscode.window.showOpenDialog({defaultUri:folder.uri,canSelectFiles:true,canSelectFolders:false,canSelectMany:false});
@@ -211,16 +242,19 @@ export function activate(context: vscode.ExtensionContext): void {
       const subscription=panel.webview.onDidReceiveMessage(async(msg:{action:string;data:Settings;field?:string;profile?:string})=>{
         try {
           if (msg.action==='pick') { const value=await pick(folder); if(value) await panel.webview.postMessage({field:msg.field,value}); return; }
-          if (!['save','sync','build','provision'].includes(msg.action)) return;
+          if (!['save','sync','build','deploy','provision'].includes(msg.action)) return;
           await panel.webview.postMessage({busy:true}); await save(folder,msg.data);
-          if(msg.action!=='save') await operation(msg.action as Action,folder,msg.profile);
-          await panel.webview.postMessage({info:msg.action==='save'?'設定を保存しました':'完了しました'});
+          const info=msg.action==='save'?'設定を保存しました':await operation(msg.action as Action,folder,msg.profile,message=>{void panel.webview.postMessage({info:message});});
+          await panel.webview.postMessage({info:info??'キャンセルしました'});
         } catch(e) { await panel.webview.postMessage({error:String(e)}); output.appendLine(String(e)); }
         finally { await panel.webview.postMessage({busy:false}); }
       });
       panel.onDidDispose(()=>subscription.dispose());
     } catch(e) { void vscode.window.showErrorMessage(String(e)); }
   }));
-  for(const action of ['build','sync','provision'] as const) context.subscriptions.push(vscode.commands.registerCommand('eclipseRemote.'+action,async()=>{try{await operation(action);}catch(e){output.show(true);void vscode.window.showErrorMessage(String(e));}}));
+  for(const action of ['build','sync','deploy','provision'] as const) context.subscriptions.push(vscode.commands.registerCommand('eclipseRemote.'+action,async()=>{
+    try { const result=await operation(action); if(result&&(action==='deploy'||action==='provision')) void vscode.window.showInformationMessage(result); return result; }
+    catch(e) { output.show(true); void vscode.window.showErrorMessage(String(e)); return false; }
+  }));
 }
 export function deactivate(): void {}
